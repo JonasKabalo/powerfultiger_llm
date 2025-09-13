@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+./venv/
+ENV/
+env/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Project specific
+# Model files and checkpoints
+model_from_scratch/checkpoint-*/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# FAISS index files - uncomment if you want to exclude them
+# *.faiss
+# *.faiss.meta
+
+# Large data files
+data/*.txt
+
+# Logs
+logs/
+*.log
+wandb/
+
+# Tokenizer - uncomment if you want users to generate their own
+# tokenizer/
+
+# Distribution / packaging
+.Python
