@@ -1,7 +1,7 @@
 ````markdown
-# Eden: Tiny LLM with RAG
+# PowerfulTiger: Tiny LLM with RAG
 
-Eden is a lightweight framework
+PowerfulTiger is a lightweight framework
 
 * If loss shows `nan` initially (especially on Apple M-series GPUs), it's normal and will stabilize.
 * `NotOpenSSLWarning` is harmless on macOS.
@@ -137,5 +137,3 @@ python chat_rag_simple.py --model_dir ./model_from_scratch --docs_dir ./docs
 ```
 
 This uses pattern matching instead of generation for more coherent responses with small models.
-
-```
