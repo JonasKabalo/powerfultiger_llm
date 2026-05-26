@@ -1,0 +1,24 @@
+{
+  "name": "powerfultiger",
+  "version": "2.0.0",
+  "description": "Local AI assistant powered by Ollama — runs 100% on your machine",
+  "main": "dist/chat.js",
+  "scripts": {
+    "start": "ts-node src/chat.ts",
+    "build": "tsc",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ollama": "^0.5.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.57.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}

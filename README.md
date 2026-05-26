@@ -1,139 +1,132 @@
-````markdown
-# PowerfulTiger: Tiny LLM with RAG
+# PowerfulTiger
 
-PowerfulTiger is a lightweight framework
-
-* If loss shows `nan` initially (especially on Apple M-series GPUs), it's normal and will stabilize.
-* `NotOpenSSLWarning` is harmless on macOS.
-* Recommended: small batch size (1-2) and learning rate \~5e-4 for tiny models.
-* For higher quality responses with very small models, try `chat_rag_simple.py` which uses pattern matching for coherent answers.ing (**Step 6**) and your LLM will respond consistently in-character.
+A local AI assistant that runs 100% on your machine. No cloud, no API keys, no data leaving your device. Powered by [Ollama](https://ollama.com) with real-time tools for time, weather, web search, math, and word definitions.
 
 ---
 
-## 📊 System Architecture
+## Features
 
-```
-┌────────────┐     ┌─────────────┐     ┌──────────────┐     ┌────────────────┐
-│  Documents │────>│  Tokenizer  │────>│  LLM Model   │────>│  RAG Chatbot   │
-│  (./docs/) │     │ (BPE-based) │     │ (GPT2-style) │     │  (Q&A system)  │
-└────────────┘     └─────────────┘     └──────────────┘     └────────────────┘
-      │                                        │                    ↑
-      │                                        │                    │
-      └────────────────────────────>┌──────────────────┐           │
-                                    │  FAISS Index     │───────────┘
-                                    │  (Vector store)  │
-                                    └──────────────────┘
-```
-
-## ⚙️ Performance Expectations
-
-- **Model Size**: This is a tiny model (typically under 100MB) designed for educational purposes and lightweight applications
-- **Context Window**: Limited to 128 tokens by default (configurable but affects memory usage)
-- **Response Quality**: Coherent but basic responses; quality improves with more training data
-- **Speed**: Fast inference even on CPU (no need for GPU at inference time)
-- **Limitations**: Cannot match capabilities of large commercial models; limited world knowledge unless provided in documents
+- **Streaming responses** — output appears word by word, just like a real conversation
+- **Agentic tool use** — the model autonomously calls tools and reasons over results
+- **5 built-in tools** — current time, live weather, web search, calculator, dictionary
+- **Persistent memory** — remembers your name, facts, and session summaries across conversations
+- **Smart model selection** — auto-picks the best available Ollama model, handles quantized variants
+- **Think-block filtering** — strips internal reasoning from qwen2.5 models so only clean answers are shown
+- **Demo mode** — works without Ollama for basic math and conversation
 
 ---
 
-### **2️⃣ How to try the LLM now**unning small language models (LLMs) with retrieval-augmented generation (RAG). This project allows you to create your own custom AI assistant with a unique persona that can leverage external knowledge to provide better responses.
+## Prerequisites
 
-## 🖥️ Prerequisites
-- Python 3.8 or higher
-- At least 4GB RAM (8GB+ recommended)
-- GPU optional but recommended for faster training
-- macOS, Linux, or Windows
-
-## 🚀 Train & Run Your Own Tiny LLM with RAG
-
-### 1. Install dependencies
-```bash
-python -m venv venv && source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-````
-
-### 2. Prepare docs
-
-* Place your `.txt` files into `./docs/`.
-  Example: `persona.txt` with your LLM persona, plus any domain-specific text.
-* Run:
-
-```bash
-bash prepare_data.sh
-```
-
-> ⚠️ **Important:** Any time you add or modify files in `./docs/`, you **must retrain the LLM** to take them into account.
-
-### 3. Train tokenizer
-
-```bash
-python train_tokenizer.py --input_dir ./docs --vocab_size 16000 --output_dir ./tokenizer
-```
-
-### 4. Train model from scratch
-
-```bash
-python train_from_scratch.py --tokenizer_dir ./tokenizer --data_file ./data/all_docs.txt \
-    --output_dir ./model_from_scratch --num_train_epochs 6 --per_device_train_batch_size 2 --block_size 128
-```
-
-* The script now automatically handles issues with column lengths during mapping.
-* After training, the tokenizer’s `vocab.json` and `merges.txt` are copied into `./model_from_scratch/`.
-* **If you change `docs/`** or your persona, **re-run this step** to retrain the model with updated data.
-
-### 5. Build FAISS index for docs
-
-```bash
-python build_index.py --docs_dir ./docs --index_file ./data/index.faiss
-```
-
-### 6. Run RAG chat REPL
-
-```bash
-python chat_rag.py --model_dir ./model_from_scratch --index_file ./data/index.faiss --docs_dir ./docs
-```
-
-* The chat script now prepends retrieved documents to your prompt.
-* ⚠️ The script automatically resizes token embeddings to match the tokenizer.
-* Prompts + retrieved docs are truncated to the model’s maximum positional embedding length to prevent crashes.
-
-### 7. Notes / Tips
-
-* If loss shows `nan` initially (especially on Apple M-series GPUs), it’s normal and will stabilize.
-* `NotOpenSSLWarning` is harmless on macOS.
-* Recommended: small batch size (1-2) and learning rate \~5e-4 for tiny models.
+- [Node.js](https://nodejs.org) v18 or higher
+- [Ollama](https://ollama.com/download) (for full AI mode)
 
 ---
 
-### **💡 How to customize your LLM persona**
+## Quick Start
 
-1. Edit or create a `.txt` file in `./docs/` (e.g., `persona.txt`):
+```bash
+# 1. Install dependencies
+npm install
 
+# 2. Pull a model (run once)
+ollama pull llama3.2:3b
+
+# 3. Start chatting
+npm start
 ```
-I am a friendly AI assistant who loves helping humans with their questions.
-I am 25 years old and enjoy reading classic literature.
-I speak politely and try to explain things clearly.
-```
 
-2. Retrain the model using **Step 4**.
-3. Build the FAISS index again (**Step 5**).
-4. Start chatting (**Step 6**) and your LLM will respond consistently in-character.
+To run without Ollama (demo mode only):
+
+```bash
+npm start -- --demo
+```
 
 ---
 
-### **2️⃣ How to try the LLM now**
+## Recommended Models
 
-```bash
-python chat_rag.py --model_dir ./model_from_scratch --index_file ./data/index.faiss --docs_dir ./docs
+PowerfulTiger picks the best installed model automatically, in this priority order:
+
+| Model | Size | Notes |
+|---|---|---|
+| `qwen2.5:7b` | ~4 GB | Best tool-calling accuracy |
+| `qwen2.5:3b` | ~2 GB | Great balance of speed and quality |
+| `llama3.2:3b` | ~2 GB | Solid default, good tool use |
+| `llama3.1:8b` | ~5 GB | Strong reasoning |
+| `llama3.2:1b` | ~1 GB | Fastest, limited capability |
+
+Quantized variants (e.g. `qwen2.5:7b-instruct-q4_K_M`) are automatically matched to their base preference.
+
+---
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/help` | Show available commands |
+| `/model` | Show the current model |
+| `/memory` | Show what PowerfulTiger remembers about you |
+| `/clear` | Wipe the conversation history for this session |
+| `/exit` | Quit and save session memory |
+
+`exit`, `quit`, and Ctrl+C also work.
+
+---
+
+## Tools
+
+The model calls these automatically — no manual invocation needed.
+
+| Tool | Trigger | Source |
+|---|---|---|
+| `get_current_time` | Any time or date question | System clock via `Intl` |
+| `get_weather` | Any weather or temperature question | [wttr.in](https://wttr.in) |
+| `web_search` | Current events, facts, news | DuckDuckGo + Wikipedia |
+| `calculate` | Any math expression | Safe `Function` evaluator |
+| `define_word` | Word definitions or meanings | [Free Dictionary API](https://dictionaryapi.dev) |
+
+All tools are free and require no API keys.
+
+---
+
+## Persistent Memory
+
+PowerfulTiger learns about you over time. On `/exit`, it extracts facts from the session (name, preferences, projects) and saves them to `~/.powerfultiger/memory.json`. These are silently injected into the next session's system prompt.
+
+Use `/memory` to see what it currently knows about you.
+
+---
+
+## Project Structure
+
+```
+src/
+  chat.ts      — REPL loop, commands, tool display
+  ollama.ts    — Ollama client, streaming, agentic tool loop
+  tools.ts     — Tool implementations and Ollama schema definitions
+  memory.ts    — Load/save/format persistent user memory
+  fallback.ts  — Demo mode (math + basic conversation, no Ollama needed)
+  ui.ts        — ANSI colors, banner, help text
 ```
 
-* Enter your prompts interactively.
-* The model will use both your persona and retrieved documents to generate answers.
+---
 
-For models with very limited context windows (128 tokens), you can also try the simplified chat script:
+## Development
 
 ```bash
-python chat_rag_simple.py --model_dir ./model_from_scratch --docs_dir ./docs
+npm run lint          # ESLint
+npm run type-check    # TypeScript (no emit)
+npm run build         # Compile to dist/
 ```
 
-This uses pattern matching instead of generation for more coherent responses with small models.
+---
+
+## How It Works
+
+1. User sends a message
+2. `streamChat` builds a context: system prompt (with today's date + memory) + last 20 messages
+3. Ollama streams a response with tool definitions available
+4. If the model calls a tool, the result is fed back and the model continues — up to 8 iterations
+5. Final text is streamed to the terminal token by token
+6. On `/exit`, a separate Ollama call extracts facts and a summary from the session and writes them to disk
