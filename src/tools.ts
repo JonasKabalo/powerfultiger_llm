@@ -167,68 +167,99 @@ function urlToSearchQuery(url: string): string {
   }
 }
 
+async function fetchDDG(query: string, ua: string): Promise<string[]> {
+  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+  const res = await fetch(url, { headers: { 'User-Agent': ua }, signal: AbortSignal.timeout(6000) });
+  if (!res.ok) return [];
+  const ddg = await res.json() as DdgResponse;
+  const out: string[] = [];
+  if (ddg.Answer)       out.push(`Direct answer: ${ddg.Answer}`);
+  if (ddg.AbstractText) out.push(`${ddg.Heading ?? ''}: ${ddg.AbstractText}${ddg.AbstractURL ? ` (${ddg.AbstractURL})` : ''}`);
+  if (ddg.Definition)   out.push(`Definition: ${ddg.Definition}`);
+  const topics = (ddg.RelatedTopics ?? []).flatMap<DdgTopic>((t) => t.Topics ?? [t]);
+  for (const t of topics.slice(0, 3)) if (t.Text) out.push(`• ${t.Text}`);
+  return out;
+}
+
+async function fetchWiki(topic: string, ua: string): Promise<string | null> {
+  if (!topic) return null;
+  const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic)}`;
+  const res = await fetch(url, { headers: { 'User-Agent': ua }, signal: AbortSignal.timeout(6000) });
+  if (!res.ok) return null;
+  const wiki = await res.json() as WikiSummary;
+  return wiki.extract ? `From Wikipedia — ${wiki.title ?? topic}:\n${wiki.extract.slice(0, 600)}` : null;
+}
+
+async function fetchPageMeta(url: string, ua: string): Promise<string | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': ua, Accept: 'text/html' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const html = (await res.text()).slice(0, 30000);
+
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const descMatch  =
+      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']{10,})/i) ??
+      html.match(/<meta[^>]+content=["']([^"']{10,})["'][^>]+name=["']description["']/i) ??
+      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{10,})/i) ??
+      html.match(/<meta[^>]+content=["']([^"']{10,})["'][^>]+property=["']og:description["']/i);
+
+    const decode = (s: string) =>
+      s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+
+    const title = titleMatch ? decode(titleMatch[1].trim()).slice(0, 120) : '';
+    const desc  = descMatch  ? decode(descMatch[1].trim()).slice(0, 400) : '';
+
+    if (!title && !desc) return null;
+    return `From the website — ${title}${desc ? `\nDescription: ${desc}` : ''}`;
+  } catch {
+    return null;
+  }
+}
+
 export async function toolWebSearch(args: SearchArgs): Promise<string> {
   const raw = args.query;
-  const urlMatch = raw.match(/https?:\/\/\S+|www\.\S+/i);
-  const query = urlMatch ? urlToSearchQuery(urlMatch[0]) : raw;
-  const UA = 'PowerfulTiger/2.0 local AI';
-
-  // Run DuckDuckGo and Wikipedia in parallel — DDG for instant answers, Wiki for factual depth
-  const [ddgResult, wikiResult] = await Promise.allSettled([
-    // ── DuckDuckGo instant answers ────────────────────────────────────────────
-    (async (): Promise<string[]> => {
-      const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-      const res = await fetch(url, {
-        headers: { 'User-Agent': UA },
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) return [];
-      const ddg = (await res.json()) as DdgResponse;
-      const out: string[] = [];
-      if (ddg.Answer) out.push(`Direct answer: ${ddg.Answer}`);
-      if (ddg.AbstractText)
-        out.push(
-          `${ddg.Heading ?? ''}: ${ddg.AbstractText}${ddg.AbstractURL ? ` (${ddg.AbstractURL})` : ''}`,
-        );
-      if (ddg.Definition) out.push(`Definition: ${ddg.Definition}`);
-      const topics = (ddg.RelatedTopics ?? []).flatMap<DdgTopic>(
-        (t) => t.Topics ?? [t],
-      );
-      for (const t of topics.slice(0, 3)) if (t.Text) out.push(`• ${t.Text}`);
-      return out;
-    })(),
-
-    // ── Wikipedia summary with smart topic extraction ─────────────────────────
-    (async (): Promise<string | null> => {
-      const topic = extractWikiTopic(query);
-      if (!topic) return null;
-      const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic)}`;
-      const res = await fetch(url, {
-        headers: { 'User-Agent': UA },
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) return null;
-      const wiki = (await res.json()) as WikiSummary;
-      return wiki.extract
-        ? `From Wikipedia — ${wiki.title ?? topic}:\n${wiki.extract.slice(0, 600)}`
-        : null;
-    })(),
-  ]);
-
+  const UA  = 'PowerfulTiger/2.0 local AI';
   const snippets: string[] = [];
-  if (ddgResult.status === 'fulfilled') snippets.push(...ddgResult.value);
-  if (wikiResult.status === 'fulfilled' && wikiResult.value)
-    snippets.push(wikiResult.value);
 
-  if (snippets.length === 0) {
-    return JSON.stringify({
-      query,
-      result:
-        'No information found. The query may be too specific or require a real-time data source.',
-    });
+  const urlMatch = raw.match(/https?:\/\/\S+|www\.\S+/i);
+
+  if (urlMatch) {
+    // ── URL mode: fetch the page directly + search by domain name ────────────
+    const pageUrl     = urlMatch[0].startsWith('http') ? urlMatch[0] : `https://${urlMatch[0]}`;
+    const domainQuery = urlToSearchQuery(pageUrl);
+
+    const [metaResult, ddgResult, wikiResult] = await Promise.allSettled([
+      fetchPageMeta(pageUrl, UA),
+      fetchDDG(domainQuery, UA),
+      fetchWiki(extractWikiTopic(domainQuery), UA),
+    ]);
+
+    if (metaResult.status === 'fulfilled' && metaResult.value) snippets.push(metaResult.value);
+    if (ddgResult.status  === 'fulfilled') snippets.push(...ddgResult.value);
+    if (wikiResult.status === 'fulfilled' && wikiResult.value) snippets.push(wikiResult.value);
+
+    if (snippets.length === 0) {
+      return JSON.stringify({ url: raw, result: 'Could not retrieve information about this website.' });
+    }
+    return JSON.stringify({ url: raw, results: snippets.join('\n\n') });
   }
 
-  return JSON.stringify({ query, results: snippets.join('\n\n') });
+  // ── Text mode: DuckDuckGo + Wikipedia in parallel ─────────────────────────
+  const [ddgResult, wikiResult] = await Promise.allSettled([
+    fetchDDG(raw, UA),
+    fetchWiki(extractWikiTopic(raw), UA),
+  ]);
+
+  if (ddgResult.status  === 'fulfilled') snippets.push(...ddgResult.value);
+  if (wikiResult.status === 'fulfilled' && wikiResult.value) snippets.push(wikiResult.value);
+
+  if (snippets.length === 0) {
+    return JSON.stringify({ query: raw, result: 'No information found. The query may be too specific or require a real-time data source.' });
+  }
+  return JSON.stringify({ query: raw, results: snippets.join('\n\n') });
 }
 
 // ── Tool: calculate ───────────────────────────────────────────────────────────

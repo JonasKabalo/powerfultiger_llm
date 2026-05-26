@@ -52,20 +52,42 @@ function toolLabel(name: string, args: Record<string, unknown>): string {
 
 function createRL(): readline.Interface {
   return readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: process.stdin.isTTY === true,
+    input:     process.stdin,
+    output:    process.stdout,
+    terminal:  process.stdin.isTTY === true,
+    crlfDelay: Infinity, // treat \r\n as one newline instantly — no per-line 100ms delay on pastes
   });
 }
 
+/**
+ * Read one user turn from stdin, collecting multi-line pastes as a single message.
+ * Lines that arrive within 150 ms of the previous one are buffered together.
+ * crlfDelay: Infinity on the rl interface ensures \r\n pastes don't stagger events.
+ */
 function ask(rl: readline.Interface, prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const onClose = () => reject(new Error('stdin closed'));
-    rl.once('close', onClose);
-    rl.question(prompt, (answer) => {
+    const lines: string[] = [];
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const done = (err?: Error) => {
+      if (timer) clearTimeout(timer);
+      rl.removeListener('line',  onLine);
       rl.removeListener('close', onClose);
-      resolve(answer);
-    });
+      if (err) { reject(err); return; }
+      resolve(lines.join('\n'));
+    };
+
+    const onLine = (line: string) => {
+      lines.push(line);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => done(), 150);
+    };
+
+    const onClose = () => done(new Error('stdin closed'));
+
+    rl.on('line',  onLine);
+    rl.on('close', onClose);
+    process.stdout.write(prompt);
   });
 }
 
@@ -165,6 +187,12 @@ async function main(): Promise<void> {
 
     const text = input.trim();
     if (text === '') continue;
+
+    // Show a line-count badge when a multi-line paste is detected
+    const lineCount = text.split('\n').length;
+    if (lineCount > 1) {
+      process.stdout.write(c.dim(`  [${lineCount} lines]\n`));
+    }
 
     // ── Commands ──────────────────────────────────────────────────────────────
     const cmd = text.toLowerCase();

@@ -121,10 +121,23 @@ You are deeply knowledgeable across science, history, culture, technology, philo
 • Lists: use only for truly enumerable items; avoid for things that flow naturally as sentences
 • Keep answers tight — don't pad with summaries of what you just said
 
+━━ CODE IN MESSAGES ━━
+When the user pastes code (TypeScript, JavaScript, Python, or any language) in their message:
+• Read the entire message — the code is real content, not a command or tool call
+• Respond with analysis, review, or improved code as requested
+• NEVER output raw JSON or a tool-call object in response to user code — that format is only for the five built-in tools listed below
+• Always wrap code in triple-backtick code blocks with the language name
+
+━━ GREETINGS ━━
+For simple hellos (hello, hi, hey, sup), keep it short and natural. Just greet back and invite conversation:
+  Good: "Hey Jonas! What's on your mind?" or "Hi! What can I help with?"
+  Bad: Monologuing about yourself, listing your capabilities, or opening with "Of course!"
+"Of course!" is for agreeing to an explicit request — it makes no sense as a response to "hello".
+
 ━━ LANGUAGE AND TONE ━━
 These are natural, human — use them when they genuinely fit:
-  "Of course!" / "Sure!" — when agreeing to a direct request
-  "Absolutely!" — when emphasising agreement
+  "Of course!" / "Sure!" — when agreeing to a clearly stated request, never as an opener to a greeting
+  "Absolutely!" — when emphasising agreement on a specific point
   "You're right" / "Good point" — when the user corrects you or makes a sharp observation
   "Interesting…" / "That's a good one" — genuine reaction to something surprising or clever
   "Ha" / "Fair enough" / "Exactly" — conversational acknowledgement when appropriate
@@ -246,14 +259,25 @@ export function pickModel(models: string[]): string | null {
 // ── Small-talk detection ──────────────────────────────────────────────────────
 
 const TOOL_TRIGGER_WORDS =
-  /https?:\/\/|www\.\S|\b(time|date|day|hour|clock|today|tomorrow|yesterday|weather|temperature|rain|snow|forecast|calculate|compute|percent|sqrt|define|meaning|synonym|search|web|news|price|stock|who is|what is|what's|who's|when|where|how much|how many|current|latest|website|site|url|link|about|find|look up|explain|history|wiki)\b/i;
+  /https?:\/\/|www\.\S|\b(time|date|day|hour|clock|today|tomorrow|yesterday|weather|temperature|rain|snow|forecast|calculate|compute|percent|sqrt|define|meaning|synonym|search|web|news|price|stock|who is|what is|what's|who's|how much|how many|current|latest|website|site|url|link|look up|when (is|was|did|will|does|do)|where (is|are|can|do))\b/i;
+
+// Detects messages that contain code — no tool is useful for code review
+const CODE_PATTERN =
+  /```|^\s*(export|import)\s+(function|class|const|let|type|interface)\b|\bfunction\s+\w+\s*\(|\bconst\s+\w+\s*[:=(]|\bclass\s+\w+\s*[{(]/m;
+
+// Self-referential questions about the AI — never need tools regardless of trigger words
+const CONVERSATIONAL_PATTERNS =
+  /\b(what'?s? (your|ur) (name|purpose|job|role|age|version)|who are you|what (are|can) you( do)?|how are you|tell me about yourself|introduce yourself|are you (an? )?ai)\b/i;
 
 /**
  * Returns true when the message is clearly conversational and needs no tools.
  * When true, we omit the tools list entirely — the model can't call what it can't see.
  */
 function isSmallTalk(msg: string): boolean {
-  return !TOOL_TRIGGER_WORDS.test(msg.trim());
+  const trimmed = msg.trim();
+  if (CONVERSATIONAL_PATTERNS.test(trimmed)) return true;
+  if (CODE_PATTERN.test(trimmed)) return true; // code review needs no external tools
+  return !TOOL_TRIGGER_WORDS.test(trimmed);
 }
 
 // ── History management ────────────────────────────────────────────────────────
