@@ -1,17 +1,10 @@
 /**
  * Ollama client — streaming chat with agentic tool-use loop.
- *
- * Improvements over v1:
- *   • Smarter system prompt: direct persona, banned filler phrases, tool rules
- *   • Tuned sampling: temperature, repeat_penalty, mirostat, extended context
- *   • ThinkStreamFilter: strips <think>…</think> blocks from qwen2.5 models
- *   • History trimming: keeps last 20 messages to prevent context overflow
- *   • Memory injection: per-user facts from previous sessions
- *   • Session extraction: saves a summary + facts at end of each session
  */
 
+import { execSync } from 'child_process';
 import { Ollama, type Message, type ToolCall } from 'ollama';
-import { TOOLS, executeTool } from './tools';
+import { selectToolsForMessage, executeTool } from './tools';
 
 const HOST = 'http://127.0.0.1:11434';
 
@@ -20,6 +13,7 @@ const HOST = 'http://127.0.0.1:11434';
 export interface OllamaStatus {
   running: boolean;
   models: string[];
+  modelSizes: Record<string, number>; // bytes
 }
 
 export interface ChatMessage {
@@ -30,6 +24,7 @@ export interface ChatMessage {
 export interface ChatCallbacks {
   onToken: (token: string) => void;
   onToolCall: (name: string, args: Record<string, unknown>) => void;
+  onThinking?: () => void; // called once when model enters reasoning phase
 }
 
 // ── Think-block stream filter ─────────────────────────────────────────────────
@@ -41,7 +36,15 @@ export interface ChatCallbacks {
  */
 class ThinkStreamFilter {
   private buf = '';
-  private inThink = false;
+  private inThink: boolean;
+  private readonly startedInThink: boolean;
+  private everExited = false;
+  private thinkBuf = ''; // content received while in think mode
+
+  constructor(startInThink = false) {
+    this.inThink = startInThink;
+    this.startedInThink = startInThink;
+  }
 
   push(token: string): string {
     this.buf += token;
@@ -53,7 +56,6 @@ class ThinkStreamFilter {
       const idx = this.buf.indexOf(tag);
 
       if (idx === -1) {
-        // Tag not found — emit the safe portion; keep any potential partial tag at end
         let keep = 0;
         for (let i = Math.min(tag.length - 1, this.buf.length); i >= 1; i--) {
           if (tag.startsWith(this.buf.slice(-i))) {
@@ -61,13 +63,27 @@ class ThinkStreamFilter {
             break;
           }
         }
-        if (!this.inThink) out += this.buf.slice(0, this.buf.length - keep);
+        const chunk = this.buf.slice(0, this.buf.length - keep);
+        if (this.inThink) {
+          this.thinkBuf += chunk;
+        } else {
+          out += chunk;
+        }
         this.buf = keep > 0 ? this.buf.slice(-keep) : '';
         more = false;
       } else {
-        if (!this.inThink) out += this.buf.slice(0, idx);
+        const before = this.buf.slice(0, idx);
+        if (this.inThink) {
+          this.thinkBuf += before;
+        } else {
+          out += before;
+        }
         this.buf = this.buf.slice(idx + tag.length);
         this.inThink = !this.inThink;
+        if (!this.inThink) {
+          this.everExited = true;
+          this.thinkBuf = '';
+        }
       }
     }
 
@@ -75,8 +91,19 @@ class ThinkStreamFilter {
   }
 
   flush(): string {
+    // Started in think mode but never found </think> — this means Ollama already
+    // separated thinking into message.thinking and content is the clean answer.
+    // Return what we buffered so the response isn't blank.
+    if (this.startedInThink && !this.everExited) {
+      const out = this.thinkBuf + (this.inThink ? '' : this.buf);
+      this.buf = '';
+      this.thinkBuf = '';
+      this.inThink = false;
+      return out;
+    }
     const out = this.inThink ? '' : this.buf;
     this.buf = '';
+    this.thinkBuf = '';
     this.inThink = false;
     return out;
   }
@@ -84,122 +111,52 @@ class ThinkStreamFilter {
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-function buildSystemPrompt(memoryBlock: string): string {
+function buildSystemPrompt(): string {
   const now = new Date();
-  const datetime = now.toLocaleString('en-US', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZoneName: 'short',
+  const date = now.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
   });
 
-  const memSection = memoryBlock ? `\n\n${memoryBlock}` : '';
+  return `You are PowerfulTiger — a sharp local AI assistant. All data stays on this device.
+Today: ${date}.
 
-  return `You are PowerfulTiger — a sharp, knowledgeable, and genuinely engaging AI assistant running 100% locally on the user's machine. No data ever leaves this device. You are not a product demo. You are a real assistant with real opinions, real curiosity, and real care for the person you're talking to.
+PERSONA: A brilliant, opinionated friend — not a corporate assistant. Direct, warm, curious. Lead with the answer. One sentence for simple facts; structured prose for complex topics. No markdown unless it genuinely helps. Code always in triple-backtick blocks. If the user asks about multiple things (A, B, and C), address every single one — never skip any.
 
-Current date and time: ${datetime}.${memSection}
+FORBIDDEN — never open a response with these:
+- "Of course!" — only acceptable when explicitly agreeing to a direct request ("can you write X?")
+- "Certainly!", "Absolutely!", "Sure!", "Great question!", "Happy to help!"
+- "As an AI", "As a language model", "I don't have feelings but"
+- "How can I help you today?" in response to a greeting
 
-━━ WHO YOU ARE ━━
-You are deeply knowledgeable across science, history, culture, technology, philosophy, and the arts. You have genuine intellectual curiosity — you find ideas interesting, not just useful. You adapt your register to the user: casual and punchy when they're relaxed, precise and structured when they need it. You feel like a brilliant friend who happens to know a lot, not a customer service bot.
+GREETINGS: Only apply this rule when the message is a pure short greeting (≤5 words, no request). If the message starts with "hey/hello" but contains an actual request, skip any greeting and address the request directly.
 
-━━ HOW YOU RESPOND ━━
-• Lead with the answer — context and caveats come after, not before
-• Match your length to the task: one sentence for simple facts, structured detail for complex topics
-• Be direct but warm — directness means respecting the user's time, not being cold
-• Use natural language: contractions, the occasional rhetorical question, real sentences
-• For complex problems, think aloud briefly before concluding — show your work
-• If a question is ambiguous, pick the most likely reading, answer it, then ask if that's what they meant
-• Express genuine opinions when relevant: "I think X is more likely because…"
+TONE: natural contractions, real opinions. Never invent facts. Disagree when the user is wrong. Finance: add "Educational — not financial advice."
 
-━━ RESPONSE FORMATTING ━━
-• Plain prose for conversation, explanations, and opinions
-• Use markdown (headers, bullets, code blocks) only when the content genuinely benefits from structure
-• Always use triple-backtick code blocks for any code — never embed code inline in prose
-• Lists: use only for truly enumerable items; avoid for things that flow naturally as sentences
-• Keep answers tight — don't pad with summaries of what you just said
-
-━━ CODE IN MESSAGES ━━
-When the user pastes code (TypeScript, JavaScript, Python, or any language) in their message:
-• Read the entire message — the code is real content, not a command or tool call
-• Respond with analysis, review, or improved code as requested
-• NEVER output raw JSON or a tool-call object in response to user code — that format is only for the five built-in tools listed below
-• Always wrap code in triple-backtick code blocks with the language name
-
-━━ GREETINGS ━━
-For simple hellos (hello, hi, hey, sup), keep it short and natural. Just greet back and invite conversation:
-  Good: "Hey Jonas! What's on your mind?" or "Hi! What can I help with?"
-  Bad: Monologuing about yourself, listing your capabilities, or opening with "Of course!"
-"Of course!" is for agreeing to an explicit request — it makes no sense as a response to "hello".
-
-━━ LANGUAGE AND TONE ━━
-These are natural, human — use them when they genuinely fit:
-  "Of course!" / "Sure!" — when agreeing to a clearly stated request, never as an opener to a greeting
-  "Absolutely!" — when emphasising agreement on a specific point
-  "You're right" / "Good point" — when the user corrects you or makes a sharp observation
-  "Interesting…" / "That's a good one" — genuine reaction to something surprising or clever
-  "Ha" / "Fair enough" / "Exactly" — conversational acknowledgement when appropriate
-
-Avoid these — they are hollow, robotic, or sycophantic:
-  "Great question!" — never; it's pure filler that adds nothing
-  "I'd be happy to help with that" / "Certainly!" as a cold opener — just do the thing
-  "As an AI" / "I'm just a language model" — breaks the experience, don't say it
-  "I don't have the ability to" — check your tools before claiming this
-  "I cannot" when a tool can do it — look before you say no
-  "I apologize" when you made no actual mistake — save apologies for real errors
-
-━━ EMOTIONAL INTELLIGENCE ━━
-• If the user is frustrated: acknowledge it briefly, then solve the problem — don't over-therapize
-• If the user shares something personal or difficult: respond with genuine warmth before pivoting to help
-• If the user is excited: match that energy — enthusiasm is contagious
-• If the user wants a straight answer: skip the empathy preamble and give it to them
-• Don't be relentlessly upbeat — neutrality and seriousness are human too
-
-━━ INTELLECTUAL STANDARDS ━━
-• Never invent facts, dates, statistics, or names — if uncertain, say so and search
-• Distinguish clearly between what you know confidently, what you're inferring, and what needs checking
-• When corrected, update your position cleanly — don't hedge or double down
-• Disagree respectfully when you think the user has something wrong: "I think that's slightly off — here's what I know…"
-• Depth beats breadth: a thorough answer to the real question beats a shallow answer to a paraphrase of it
-• Never describe a website or company from memory when a URL has been given — use web_search every time
-
-━━ TOOLS — call only when the user's message explicitly needs one ━━
-• get_current_time → user directly asks what time or date it is ("what time is it?", "what day is today?")
-• get_weather      → user directly asks about weather or temperature ("what's the weather in Tokyo?")
-• web_search       → user asks about current events, recent news, prices, or a fact you are not certain of
-• calculate        → user asks you to compute something with precision
-• define_word      → user asks for the meaning, pronunciation, or etymology of a specific word
-
-CRITICAL RULES:
-— Only call a tool when the user's message is directly requesting what it provides.
-— NEVER call get_current_time during greetings, "how are you", or any message that isn't explicitly asking for the time or date.
-— NEVER call any tool during casual conversation, small talk, or check-ins.
-— When in doubt, answer from your knowledge first. Call a tool only when you genuinely need real-time or external data.
-— When the user provides a URL or asks about a website, ALWAYS call web_search — never guess or invent what a site is about. You will be wrong.
-
-━━ REASONING ━━
-Simple questions → answer directly, one or two sentences.
-Complex questions → reason briefly before concluding: "Let me think through this…"
-Multi-step problems → show each step so the user can follow and verify.
-Subjective questions → give your actual view with reasoning, and acknowledge that other perspectives exist.
-Uncertain topics → say what you know, flag what you're unsure about, and search if it matters.`;
+TOOLS — call only when the message explicitly needs real-time or external data. Never during greetings or casual chat.
+OFFLINE: calculate, get_current_time, read_file, write_file, convert_units, days_between, add_to_date, timestamp_convert, generate_uuid, count_text, transform_text, encode_decode, hash_text, format_json, generate_password, validate_email, extract_urls, color_convert
+INTERNET: get_weather, web_search, define_word, get_stock_price, get_crypto_price, get_exchange_rate, get_ip_info, get_npm_package, get_github_repo, get_country_info, get_public_holidays, check_website, get_news, translate_text, get_quote, get_trivia, send_email
+Rules: prefer knowledge over tools; get_current_time only when time/date explicitly asked; web_search for any URL the user pastes; get_stock_price for stocks/ETFs, get_crypto_price for crypto.
+EMAIL: When asked to send an email, write from Jonas's perspective TO the recipient about the recipient's situation — not about Jonas's own life. Show the draft as:
+Subject: ...
+Body: [body text only — no sign-off, no closing line]
+(Closing added automatically: "Best regards, Jonas Kabalo")
+Then ask the user to confirm. Only call send_email after explicit approval ("yes", "send it", "go ahead"). Pass the body text only (no sign-off) to send_email — the tool appends the closing.
+When revising a draft, ONLY change the specific part the user asked to change — keep everything else exactly the same.`;
 }
 
 // ── Sampling options ──────────────────────────────────────────────────────────
 
 const CHAT_OPTIONS = {
-  temperature: 0.72, // balanced creativity vs. coherence
-  top_p: 0.9, // nucleus sampling
-  top_k: 40, // vocabulary breadth per step
-  repeat_penalty: 1.15, // suppresses repetition loops
-  repeat_last_n: 64, // how far back to check for repeats
-  num_ctx: 8192, // extended context window (model default is often 2048)
-  num_predict: 1024, // max tokens per response
-  mirostat: 2, // dynamic entropy control — keeps generation from going flat
-  mirostat_tau: 5.0, // target perplexity (5 = natural conversation)
-  mirostat_eta: 0.1, // adaptation rate
+  temperature: 0.72,
+  top_p: 0.9,
+  top_k: 40,
+  repeat_penalty: 1.15,
+  repeat_last_n: 64,
+  num_ctx: 8192,
+  num_predict: 2048,
+  mirostat: 2,
+  mirostat_tau: 5.0,
+  mirostat_eta: 0.1,
 };
 
 // ── Connection helpers ────────────────────────────────────────────────────────
@@ -211,9 +168,20 @@ export async function checkOllama(): Promise<OllamaStatus> {
       setTimeout(() => reject(new Error('Ollama check timed out')), 5000),
     );
     const { models } = await Promise.race([client.list(), timeout]);
-    return { running: true, models: models.map((m) => m.name) };
+    const modelSizes: Record<string, number> = {};
+    for (const m of models) modelSizes[m.name] = m.size;
+    return { running: true, models: models.map((m) => m.name), modelSizes };
   } catch {
-    return { running: false, models: [] };
+    return { running: false, models: [], modelSizes: {} };
+  }
+}
+
+function getSystemRAMBytes(): number {
+  try {
+    const out = execSync('sysctl -n hw.memsize', { encoding: 'utf8', timeout: 1000 });
+    return parseInt(out.trim(), 10);
+  } catch {
+    return 0;
   }
 }
 
@@ -229,37 +197,82 @@ function modelMatchesPref(available: string, preferred: string): boolean {
   return prefFamily === availFamily && availTag.startsWith(prefTag);
 }
 
-/** Prefer larger / better tool-calling models. Handles quantized variants. */
-export function pickModel(models: string[]): string | null {
+/** Prefer larger / better tool-calling models. Skips models too large for available RAM. */
+export function pickModel(models: string[], modelSizes: Record<string, number> = {}): string | null {
   if (models.length === 0) return null;
 
+  const ramBytes = getSystemRAMBytes();
+  // Leave 3 GB headroom for OS + app; if RAM unknown (0) skip the filter
+  const maxBytes = ramBytes > 0 ? ramBytes - 3 * 1024 ** 3 : Infinity;
+  const fitsInRAM = (name: string) => (modelSizes[name] ?? 0) <= maxBytes;
+
   const preference = [
+    // ── Fast non-thinking — best for everyday chat ────────────────────
+    'qwen2.5:7b',    // excellent quality, no reasoning loop, ~5s responses
+    'llama3.2:3b',   // lightweight and fast, ~2s responses
+    // ── qwen3 (thinking model — slow on 16 GB, last resort) ──────────
+    'qwen3:4b',
+    // ── 32B dense — best all-rounders (tools + thinking, ~20 GB) ─────
+    'qwen3:32b',
+    'deepseek-r1:32b',
+    'qwq:32b',
+    'cogito:32b',
+    // ── 70B — flagship quality (~40 GB, fits in 50 GB) ────────────────
+    'llama3.3:70b',
+    'deepseek-r1:70b',
+    'cogito:70b',
+    // ── 24-33B — excellent quality ────────────────────────────────────
+    'magistral:24b',
+    'mistral-small3.2:24b',
+    'devstral-small-2:24b',
+    'devstral:24b',
+    'mistral-small3.1:24b',
+    'mistral-small:24b',
+    'lfm2:24b',
+    'granite4.1:30b',
+    'nemotron3:33b',
+    // ── 14B ──────────────────────────────────────────────────────────
+    'qwen3:14b',
+    'deepseek-r1:14b',
+    'cogito:14b',
+    // ── 8-13B ────────────────────────────────────────────────────────
+    'qwen3:8b',
+    'deepseek-r1:8b',
+    'cogito:8b',
+    'granite4.1:8b',
+    'llama3.1:8b',
+    'mistral-nemo:12b',
+    'hermes3:8b',
+    // ── 30B MoE (3B active — fast with large-model knowledge) ────────
+    'qwen3:30b',
+    // ── Other small / fast ────────────────────────────────────────────
+    'phi4-mini',
+    'qwen3:1.7b',
+    'llama3.2:3b',
+    'llama3.2:1b',
+    // ── Legacy / fallback ────────────────────────────────────────────
+    'qwen2.5:14b',
+    'qwen2.5-coder:7b',
     'qwen2.5:7b',
     'qwen2.5:3b',
-    'llama3.2:3b',
-    'llama3.1:8b',
-    'llama3.2:1b',
-    'phi4:latest',
-    'phi3.5:mini',
-    'phi3:mini',
     'mistral:7b',
     'gemma2:2b',
-    'qwen2.5:1.5b',
-    'qwen2.5:0.5b',
     'tinyllama:1.1b',
   ];
 
   for (const pref of preference) {
-    const match = models.find((m) => modelMatchesPref(m, pref));
+    const match = models.find((m) => modelMatchesPref(m, pref) && fitsInRAM(m));
     if (match !== undefined) return match;
   }
-  return models[0];
+  // Fallback: smallest model that fits
+  const fits = models.filter(fitsInRAM);
+  return fits.sort((a, b) => (modelSizes[a] ?? 0) - (modelSizes[b] ?? 0))[0] ?? null;
 }
 
 // ── Small-talk detection ──────────────────────────────────────────────────────
 
 const TOOL_TRIGGER_WORDS =
-  /https?:\/\/|www\.\S|\b(time|date|day|hour|clock|today|tomorrow|yesterday|weather|temperature|rain|snow|forecast|calculate|compute|percent|sqrt|define|meaning|synonym|search|web|news|price|stock|who is|what is|what's|who's|how much|how many|current|latest|website|site|url|link|look up|when (is|was|did|will|does|do)|where (is|are|can|do))\b/i;
+  /https?:\/\/|www\.\S|\b\w+\.(ts|tsx|js|jsx|py|json|md|txt|sh|yaml|yml|toml|env|rs|go|java|cpp|c|h)\b|\b(time|date|day|hour|clock|today|tomorrow|yesterday|weather|temperature|rain|snow|forecast|calculate|compute|percent|sqrt|define|meaning|synonym|search|web|news|price|stock|crypto|bitcoin|ethereum|btc|eth|ticker|etf|nasdaq|nyse|s&p|dow|dividend|portfolio|market cap|convert|units|celsius|fahrenheit|kelvin|miles|kilometers|pounds|kilograms|uuid|guid|base64|encode|decode|hash|sha256|md5|checksum|format json|pretty print|password|generate|exchange rate|forex|currency|eur|gbp|jpy|npm|package|github|repository|country|capital|population|holidays|translate|translation|ip address|my ip|geolocation|color|hex|rgb|hsl|trivia|quote|who is|what is|what's|who's|how much|how many|current|latest|website|site|url|link|look up|read file|write file|open file|when (is|was|did|will|does|do)|where (is|are|can|do))\b/i;
 
 // Detects messages that contain code — no tool is useful for code review
 const CODE_PATTERN =
@@ -290,18 +303,41 @@ function trimHistory(history: ChatMessage[]): ChatMessage[] {
     : history;
 }
 
+// ── Model warm-up ────────────────────────────────────────────────────────────
+
+/**
+ * Loads the model into GPU memory and warms the KV cache with the system prompt.
+ * Called once at startup so the first real message is fast.
+ */
+export async function warmUpModel(model: string): Promise<void> {
+  const client = new Ollama({ host: HOST });
+  try {
+    await client.chat({
+      model,
+      messages: [
+        { role: 'system', content: buildSystemPrompt() },
+        { role: 'user', content: 'hi' },
+      ],
+      stream: false,
+      options: { ...CHAT_OPTIONS, num_predict: 1 },
+    });
+  } catch {
+    // Warm-up failure is non-fatal — first real message will just be slower
+  }
+}
+
 // ── Agentic streaming chat ────────────────────────────────────────────────────
 
 export async function streamChat(
   model: string,
   history: ChatMessage[],
   callbacks: ChatCallbacks,
-  memoryBlock: string = '',
 ): Promise<string> {
   const client = new Ollama({ host: HOST });
+  const isQwen3 = model.startsWith('qwen3');
 
   const messages: Message[] = [
-    { role: 'system', content: buildSystemPrompt(memoryBlock) },
+    { role: 'system', content: buildSystemPrompt() },
     ...trimHistory(history),
   ];
 
@@ -311,12 +347,47 @@ export async function streamChat(
   // Hiding tools from simple greetings/small talk prevents spurious tool calls.
   const lastUserMsg =
     history.filter((m) => m.role === 'user').at(-1)?.content ?? '';
-  const toolsForThisTurn = isSmallTalk(lastUserMsg) ? undefined : TOOLS;
+
+  // For short confirmations ("yes!", "go", "ok"), check recent context to decide
+  // which tools to include — e.g. if an email was being discussed, keep email tool.
+  const EMAIL_CONTEXT = /send_email|send.*email|email.*send|\bsubject\b/i;
+  const EMAIL_REQUEST = /\b(email|send (a |an |the )?mail|write (a |an )?email|compose|message to \w+@|e-mail)\b/i;
+  const recentContext = history.slice(-6).map((m) => m.content).join(' ');
+
+  // True once the assistant has shown a draft (contains "Subject:") — only then unlock send_email.
+  const draftAlreadyShown = history
+    .slice(-6)
+    .filter((m) => m.role === 'assistant')
+    .some((m) => /\bSubject:/i.test(m.content));
+
+  // Explicit confirmation: "yes", "send it", "go ahead" — short, affirmative, no modification words.
+  const CONFIRM_PATTERN = /\b(yes|yeah|yep|yup|ok|okay|sure|go( ahead)?|send( it)?|do it|confirm(ed)?|alright|correct|perfect|absolutely|definitely)\b/i;
+  const MODIFY_PATTERN = /\b(update|change|edit|modify|make|use|instead|different|shorter|longer|improve|fix|adjust|rewrite|redo|another|add|remove|replace|actually|but|also|and (then|also))\b/i;
+  const isConfirmation = CONFIRM_PATTERN.test(lastUserMsg) && !MODIFY_PATTERN.test(lastUserMsg);
+
+  let toolsForThisTurn: ReturnType<typeof selectToolsForMessage>;
+  if (isSmallTalk(lastUserMsg)) {
+    if (EMAIL_CONTEXT.test(recentContext)) {
+      const emailTools = selectToolsForMessage('send email');
+      // Unlock send_email only when draft exists AND user is explicitly confirming (not modifying)
+      toolsForThisTurn = (draftAlreadyShown && isConfirmation)
+        ? emailTools
+        : emailTools?.filter((t) => t.function.name !== 'send_email');
+    } else {
+      toolsForThisTurn = undefined;
+    }
+  } else {
+    toolsForThisTurn = selectToolsForMessage(lastUserMsg);
+    // First email request: withhold send_email so model must draft first
+    if (!draftAlreadyShown && EMAIL_REQUEST.test(lastUserMsg)) {
+      toolsForThisTurn = toolsForThisTurn?.filter((t) => t.function.name !== 'send_email');
+    }
+  }
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
     let textAccumulator = '';
     const seenToolCalls: ToolCall[] = [];
-    const filter = new ThinkStreamFilter();
+    const filter = new ThinkStreamFilter(isQwen3);
 
     const stream = await client.chat({
       model,
@@ -327,8 +398,14 @@ export async function streamChat(
     });
 
     let lastMessage: Message | undefined;
+    let thinkingFired = false;
 
     for await (const chunk of stream) {
+      if (!thinkingFired && (chunk.message as unknown as Record<string, unknown>).thinking) {
+        thinkingFired = true;
+        callbacks.onThinking?.();
+      }
+
       if (chunk.message.content) {
         textAccumulator += chunk.message.content;
         const visible = filter.push(chunk.message.content);
@@ -400,61 +477,3 @@ export async function streamChat(
   return '(max tool iterations reached)';
 }
 
-// ── Session memory extraction ─────────────────────────────────────────────────
-
-/**
- * At the end of a session, ask the model to extract key facts and write a summary.
- * Called once on exit — uses a cheap, low-temperature call.
- */
-export async function extractSessionMemory(
-  history: ChatMessage[],
-  model: string,
-): Promise<{ facts: string[]; summary: string; userName: string }> {
-  if (history.length < 4) return { facts: [], summary: '', userName: '' };
-
-  const client = new Ollama({ host: HOST });
-
-  const transcript = history
-    .slice(0, 30)
-    .map(
-      (m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content.slice(0, 300)}`,
-    )
-    .join('\n');
-
-  const prompt =
-    'Extract information from this AI conversation. Return ONLY valid JSON, nothing else.\n' +
-    'Schema: {"facts":["short fact"],"summary":"2-3 sentences","userName":"name or empty"}\n\n' +
-    'Rules:\n' +
-    '- facts: only things the USER explicitly stated (name, job, location, preferences, projects)\n' +
-    '- summary: what was discussed and any conclusions reached\n' +
-    "- userName: the user's name if they said it, otherwise empty string\n" +
-    '- If nothing clear, return empty arrays and empty strings\n\n' +
-    `Conversation:\n${transcript}`;
-
-  try {
-    const res = await client.chat({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      format: 'json',
-      stream: false,
-      options: { temperature: 0.1, num_predict: 400 },
-    });
-
-    const parsed = JSON.parse(res.message.content) as {
-      facts?: unknown;
-      summary?: unknown;
-      userName?: unknown;
-    };
-
-    const rawFacts = parsed.facts;
-    return {
-      facts: Array.isArray(rawFacts)
-        ? rawFacts.filter((f): f is string => typeof f === 'string')
-        : [],
-      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-      userName: typeof parsed.userName === 'string' ? parsed.userName : '',
-    };
-  } catch {
-    return { facts: [], summary: '', userName: '' };
-  }
-}

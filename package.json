@@ -11,7 +11,10 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "ollama": "^0.5.12"
+    "@types/nodemailer": "^8.0.0",
+    "dotenv": "^17.4.2",
+    "nodemailer": "^8.0.9",
+    "ollama": "^0.6.3"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
